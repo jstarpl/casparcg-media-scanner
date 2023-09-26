@@ -1,19 +1,16 @@
 import cp from 'child_process'
 import { Observable } from 'rxjs'
 import { concatMap } from 'rxjs/operators'
-import util from 'util'
+
 import chokidar from 'chokidar'
 import mkdirp from 'mkdirp'
 import os from 'os'
-import fs from 'fs'
+import fs from 'fs/promises'
+
 import path from 'path'
 import { getId } from './util'
 import moment from 'moment'
 import { Logger } from 'pino'
-
-const statAsync = util.promisify(fs.stat)
-const unlinkAsync = util.promisify(fs.unlink)
-const readFileAsync = util.promisify(fs.readFile)
 
 export default function ({ config, db, logger }: { config: Record<string, any>; db: any; logger: Logger }): void {
 	Observable.create((o: any) => {
@@ -64,11 +61,11 @@ export default function ({ config, db, logger }: { config: Record<string, any>; 
 		while (true) {
 			const deleted: Array<any> = []
 
-			const { rows } = await db.allDocs({
+			const { rows } = (await db.allDocs({
 				include_docs: true,
 				startkey,
 				limit,
-			}) as any
+			})) as any
 			await Promise.all(
 				rows.map(async ({ doc }: { doc: any }) => {
 					try {
@@ -76,7 +73,8 @@ export default function ({ config, db, logger }: { config: Record<string, any>; 
 						const mediaPath = path.normalize(doc.mediaPath)
 						if (mediaPath.indexOf(mediaFolder) === 0) {
 							try {
-								const stat = await statAsync(doc.mediaPath)
+								const stat = await fs.stat(doc.mediaPath)
+
 								if (stat.isFile()) {
 									return
 								}
@@ -135,11 +133,23 @@ export default function ({ config, db, logger }: { config: Record<string, any>; 
 		doc.mediaSize = mediaStat.size
 		doc.mediaTime = mediaStat.mtime.getTime()
 
+		// ensure that the file is complete and ready for reading
+		await retryWithDelay(
+			async () => {
+				const file = await fs.open(mediaPath, fs.constants.O_RDWR)
+				await file.close()
+			},
+			60,
+			1000
+		).catch((err) => {
+			mediaLogger.error({ err }, 'File was not ready for reading after 60 seconds.')
+		})
+
 		await Promise.all([
-			generateInfo(doc).catch((err) => {
+			retryWithDelay(async () => generateInfo(doc), 3, 3000).catch((err) => {
 				mediaLogger.error({ err }, 'Info Failed')
 			}),
-			generateThumb(doc).catch((err) => {
+			retryWithDelay(async () => generateThumb(doc), 3, 3000).catch((err) => {
 				mediaLogger.error({ err }, 'Thumbnail Failed')
 			}),
 		])
@@ -147,6 +157,26 @@ export default function ({ config, db, logger }: { config: Record<string, any>; 
 		await db.put(doc)
 
 		mediaLogger.info('Scanned')
+	}
+
+	async function sleep(ms: number): Promise<void> {
+		return new Promise((resolve) => {
+			setTimeout(() => resolve(), ms)
+		})
+	}
+
+	async function retryWithDelay<T>(func: () => Promise<T>, retryCount: number, delay: number): Promise<T> {
+		let lastError
+		for (let i = 1; i <= retryCount; i++) {
+			try {
+				const result = await func()
+				return result
+			} catch (e) {
+				lastError = e
+				await sleep(delay)
+			}
+		}
+		throw lastError
 	}
 
 	async function generateThumb(doc: any) {
@@ -170,7 +200,8 @@ export default function ({ config, db, logger }: { config: Record<string, any>; 
 			cp.exec(args.join(' '), (err) => (err ? reject(err) : resolve()))
 		})
 
-		const thumbStat = await statAsync(tmpPath)
+		const thumbStat = await fs.stat(tmpPath)
+
 		doc.thumbSize = thumbStat.size
 		doc.thumbTime = thumbStat.mtime.getTime()
 		doc.tinf =
@@ -184,10 +215,10 @@ export default function ({ config, db, logger }: { config: Record<string, any>; 
 		doc._attachments = {
 			'thumb.png': {
 				content_type: 'image/png',
-				data: await readFileAsync(tmpPath),
+				data: await fs.readFile(tmpPath),
 			},
 		}
-		await unlinkAsync(tmpPath)
+		await fs.unlink(tmpPath)
 	}
 
 	async function generateInfo(doc: Record<string, any>) {
