@@ -1,11 +1,13 @@
 import cp from 'child_process'
 import { Observable } from 'rxjs'
 import { concatMap } from 'rxjs/operators'
+import PQueue from 'p-queue-compat'
 
 import chokidar from 'chokidar'
 import mkdirp from 'mkdirp'
 import os from 'os'
 import fs from 'fs/promises'
+import { Stats as fsStats } from 'fs'
 
 import path from 'path'
 import { getId } from './util'
@@ -13,6 +15,8 @@ import moment from 'moment'
 import { Logger } from 'pino'
 
 export default function ({ config, db, logger }: { config: Record<string, any>; db: any; logger: Logger }): void {
+	const queue = new PQueue({ concurrency: 1 })
+
 	Observable.create((o: any) => {
 		const watcher = chokidar
 			.watch(
@@ -106,7 +110,7 @@ export default function ({ config, db, logger }: { config: Record<string, any>; 
 	}
 	void cleanDeleted()
 
-	async function scanFile(mediaPath: string, mediaId: string, mediaStat: fs.Stats) {
+	async function scanFile(mediaPath: string, mediaId: string, mediaStat: fsStats) {
 		if (!mediaId || mediaStat.isDirectory()) {
 			return
 		}
@@ -134,16 +138,12 @@ export default function ({ config, db, logger }: { config: Record<string, any>; 
 		doc.mediaTime = mediaStat.mtime.getTime()
 
 		// ensure that the file is complete and ready for reading
-		await retryWithDelay(
-			async () => {
-				const file = await fs.open(mediaPath, fs.constants.O_RDWR)
-				await file.close()
-			},
-			60,
-			1000
-		).catch((err) => {
-			mediaLogger.error({ err }, 'File was not ready for reading after 60 seconds.')
-		})
+		try {
+			await ensureReadableFile(mediaPath)
+		} catch (e) {
+			mediaLogger.warn(`Could not ensure file is readable: ${e}`)
+			return
+		}
 
 		await Promise.all([
 			retryWithDelay(async () => generateInfo(doc), 3, 3000).catch((err) => {
@@ -177,6 +177,33 @@ export default function ({ config, db, logger }: { config: Record<string, any>; 
 			}
 		}
 		throw lastError
+	}
+
+	async function ensureReadableFile(filePath: string): Promise<void> {
+		while (await fileExists(filePath)) {
+			try {
+				await queue.add(async () => isFileIsReadable(filePath))
+				return
+			} catch {
+				await sleep(10000)
+			}
+		}
+
+		throw new Error(`File "${filePath}" is not accessible`)
+	}
+
+	async function fileExists(filePath: string): Promise<boolean> {
+		try {
+			await fs.access(filePath, fs.constants.F_OK)
+			return true
+		} catch {
+			return false
+		}
+	}
+
+	async function isFileIsReadable(filePath: string): Promise<void> {
+		const file = await fs.open(filePath, fs.constants.O_RDONLY)
+		await file.close()
 	}
 
 	async function generateThumb(doc: any) {
