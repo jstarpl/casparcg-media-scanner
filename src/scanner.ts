@@ -185,7 +185,7 @@ export default function ({ config, db, logger }: { config: Record<string, any>; 
 				await queue.add(async () => isFileIsReadable(filePath))
 				return
 			} catch {
-				await sleep(10000)
+				await sleep(3000)
 			}
 		}
 
